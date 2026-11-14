@@ -1,5 +1,6 @@
 #include "prx/libSceVoice/include/Api.hpp"
 #include <cstdint>
+#include <cerrno>
 #include <cstddef>
 #include <cstring>
 #include <cmath>
@@ -306,8 +307,11 @@ int APS5_VABI sceVoiceGetVolume(std::uint32_t portId, float* volume) {
     if (!volume) return InvalidArgument;
     const auto found = voice.ports.find(portId);
     if (found == voice.ports.end()) return PortNotFound;
-    *volume = found->second.volume;
-    return 0;
+    const float localVolume = found->second.volume;
+    const int savedErrno = errno;
+    const bool copied = GuestCopyOut_nid_no_patch(volume, &localVolume, sizeof(localVolume));
+    errno = savedErrno;
+    return copied ? 0 : InvalidArgument;
 }
 
 int APS5_VABI sceVoiceGetPortInfo(uint32_t port_id, VoicePortInfo* info) {

@@ -10,6 +10,12 @@
 #include <limits>
 #include <stdexcept>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -70,10 +76,79 @@ std::uint32_t CreatePort(std::int32_t type, float volume) {
     return id;
 }
 
+void TestVolumeGuestMemory() {
+    constexpr auto invalidArgument = static_cast<int>(0x804e0805u);
+    constexpr auto invalidPort = static_cast<int>(0x804e0804u);
+    constexpr auto portNotFound = static_cast<int>(0x804e0807u);
+#ifdef _WIN32
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const std::size_t page = info.dwPageSize;
+    auto* memory = static_cast<unsigned char*>(VirtualAlloc(nullptr, page * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    Require(memory != nullptr);
+    DWORD previous;
+    Require(VirtualProtect(memory + page, page, PAGE_NOACCESS, &previous) != 0);
+#else
+    const long pageSize = sysconf(_SC_PAGESIZE);
+    Require(pageSize > 0);
+    const auto page = static_cast<std::size_t>(pageSize);
+    auto* memory = static_cast<unsigned char*>(mmap(nullptr, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    Require(memory != MAP_FAILED);
+    Require(mprotect(memory + page, page, PROT_NONE) == 0);
+#endif
+    auto* inaccessible = reinterpret_cast<float*>(memory + page);
+    Require(sceVoiceGetVolume(0, inaccessible) == NotInitialized);
+    VoiceInitParam init{};
+    init.app_type = 0x10000000;
+    Require(sceVoiceInit(&init, 100) == 0);
+    Require(sceVoiceGetVolume(128, inaccessible) == invalidPort);
+    Require(sceVoiceGetVolume(127, inaccessible) == portNotFound);
+    const auto id = CreatePort(3, -2.0f);
+    for (const auto offset : {page, page - sizeof(float) / 2}) {
+        errno = EDOM;
+        Require(sceVoiceGetVolume(id, reinterpret_cast<float*>(memory + offset)) == invalidArgument);
+        Require(errno == EDOM);
+        float value = 0;
+        Require(sceVoiceGetVolume(id, &value) == 0 && value == -2.0f);
+    }
+    std::memset(memory, 0xa5, page);
+    auto* exact = reinterpret_cast<float*>(memory + page - sizeof(float));
+#ifdef _WIN32
+    Require(VirtualProtect(memory, page, PAGE_READONLY, &previous) != 0);
+#else
+    Require(mprotect(memory, page, PROT_READ) == 0);
+#endif
+    errno = EDOM;
+    Require(sceVoiceGetVolume(id, exact) == invalidArgument && errno == EDOM);
+    for (std::size_t i = 0; i < page; ++i) Require(memory[i] == 0xa5);
+#ifdef _WIN32
+    Require(VirtualProtect(memory, page, PAGE_READWRITE, &previous) != 0);
+#else
+    Require(mprotect(memory, page, PROT_READ | PROT_WRITE) == 0);
+#endif
+    for (const float value : {-2.0f, -0.0f, 0.25f, std::numeric_limits<float>::max()}) {
+        Require(sceVoiceSetVolume(id, value) == 0);
+        errno = EDOM;
+        Require(sceVoiceGetVolume(id, exact) == 0 && errno == EDOM);
+        Require(std::memcmp(exact, &value, sizeof(value)) == 0);
+        for (std::size_t i = 0; i < page - sizeof(float); ++i) Require(memory[i] == 0xa5);
+    }
+    Require(sceVoiceDeletePort(id) == 0);
+    Require(sceVoiceGetVolume(id, inaccessible) == portNotFound);
+    Require(sceVoiceEnd_nid_postfix() == 0);
+    Require(sceVoiceGetVolume(id, inaccessible) == NotInitialized);
+#ifdef _WIN32
+    Require(VirtualFree(memory, 0, MEM_RELEASE) != 0);
+#else
+    Require(munmap(memory, page * 2) == 0);
+#endif
+}
+
 } // namespace
 
 int main() {
     TestNotInitialized();
+    TestVolumeGuestMemory();
     constexpr auto notInitialized = static_cast<std::int32_t>(0x804e0801u);
     constexpr auto invalidPort = static_cast<std::int32_t>(0x804e0804u);
     constexpr auto invalidArgument = static_cast<std::int32_t>(0x804e0805u);
@@ -304,6 +379,7 @@ int main() {
     Require(sceVoiceResetPort(output) == 0);
     Require(sceVoiceEnd_nid_postfix() == 0);
     TestNotInitialized();
+    TestVolumeGuestMemory();
     Require(sceVoiceResetPort(output) == notInitialized);
     Require(sceVoiceResumePort(output) == notInitialized);
     Require(sceVoiceGetResourceInfo(nullptr) == notInitialized);
