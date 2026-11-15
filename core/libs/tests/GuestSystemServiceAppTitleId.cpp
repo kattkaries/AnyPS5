@@ -1,13 +1,21 @@
 #include "prx/libSceSystemService/include/SystemService.hpp"
 #include "prx/libSceSystemService/SystemService.hpp"
 #include "SceTypes.hpp"
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <initializer_list>
 #include <string_view>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -53,6 +61,57 @@ bool GetAppIdRejects(const char* titleId) {
 bool IsAppLaunchedRejects(const char* titleId) {
     bool launched = false;
     return sceLncUtilIsAppLaunched(titleId, &launched) == LNC_UTIL_ERROR_INVALID_ARGUMENT && !launched && sceLncUtilIsAppLaunched(titleId, nullptr) == LNC_UTIL_ERROR_INVALID_ARGUMENT;
+}
+
+void CheckLaunchedOutput(const char* titleId) {
+#ifdef _WIN32
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const std::size_t pageSize = info.dwPageSize;
+    auto* memory = static_cast<unsigned char*>(VirtualAlloc(nullptr, pageSize * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    Require(memory != nullptr);
+    DWORD previous = 0;
+    Require(VirtualProtect(memory + pageSize, pageSize, PAGE_NOACCESS, &previous) != 0);
+#else
+    const long hostPageSize = sysconf(_SC_PAGESIZE);
+    Require(hostPageSize > 0);
+    const auto pageSize = static_cast<std::size_t>(hostPageSize);
+    auto* memory = static_cast<unsigned char*>(mmap(nullptr, pageSize * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    Require(memory != MAP_FAILED);
+    Require(mprotect(memory + pageSize, pageSize, PROT_NONE) == 0);
+#endif
+    for (bool* output : {reinterpret_cast<bool*>(0x10), reinterpret_cast<bool*>(memory + pageSize)}) {
+        errno = 71;
+        Require(sceLncUtilIsAppLaunched(titleId, output) == LNC_UTIL_ERROR_INVALID_ARGUMENT);
+        Require(errno == 71);
+        Require(sceLncUtilIsAppLaunched("", output) == LNC_UTIL_ERROR_INVALID_ARGUMENT);
+        Require(Throws([&] { sceLncUtilIsAppLaunched("PPSA00001", output); }));
+    }
+    std::memset(memory, Sentinel, pageSize);
+    auto* output = reinterpret_cast<bool*>(memory + pageSize - sizeof(bool));
+    *output = false;
+#ifdef _WIN32
+    Require(VirtualProtect(memory, pageSize, PAGE_READONLY, &previous) != 0);
+#else
+    Require(mprotect(memory, pageSize, PROT_READ) == 0);
+#endif
+    errno = 71;
+    Require(sceLncUtilIsAppLaunched(titleId, output) == LNC_UTIL_ERROR_INVALID_ARGUMENT);
+    Require(errno == 71 && !*output);
+#ifdef _WIN32
+    Require(VirtualProtect(memory, pageSize, PAGE_READWRITE, &previous) != 0);
+#else
+    Require(mprotect(memory, pageSize, PROT_READ | PROT_WRITE) == 0);
+#endif
+    errno = 71;
+    Require(sceLncUtilIsAppLaunched(titleId, output) == 0 && *output);
+    Require(errno == 71);
+    for (std::size_t index = 0; index < pageSize - sizeof(bool); ++index) Require(memory[index] == Sentinel);
+#ifdef _WIN32
+    Require(VirtualFree(memory, 0, MEM_RELEASE) != 0);
+#else
+    Require(munmap(memory, pageSize * 2) == 0);
+#endif
 }
 
 void CheckRunningTitleLookups(const char* titleId, int runningAppId) {
@@ -106,6 +165,7 @@ void CheckKnownTitle(int runningAppId) {
         Require(GetAppIdRejects(malformed));
         Require(IsAppLaunchedRejects(malformed));
     }
+    CheckLaunchedOutput("PPSA00000");
     CheckRunningTitleLookups("PPSA00000", runningAppId);
 
     GuardedBuffer buffer;
