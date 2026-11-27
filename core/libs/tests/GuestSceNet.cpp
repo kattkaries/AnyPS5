@@ -1525,8 +1525,34 @@ static void CheckRecvmsgNameFaults() {
     char buffer[32]{};
     NetIovec vectors[]{{buffer, sizeof(buffer)}};
     NetMsghdr message{name, 16, vectors, 1, nullptr, 0, -1};
+#ifdef _WIN32
     Require(Failed(sceNetRecvmsg(receiver, &message, 0), 35));
+#else
+    Require(Failed(sceNetRecvmsg(receiver, &message, 0), 14));
+#endif
     Require(message.name_length == 16 && message.flags == -1);
+#ifdef _WIN32
+    const int blocking = 0;
+    Require(sceNetSetsockopt(receiver, 0xffff, 0x1200, &blocking, sizeof(blocking)) == 0);
+    std::atomic<bool> blockingReceiveFinished{false};
+    std::int64_t blockingReceiveResult = -1;
+    std::thread blockingReceive([&] {
+        blockingReceiveResult = sceNetRecvmsg(receiver, &message, 0);
+        blockingReceiveFinished.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Require(!blockingReceiveFinished.load());
+    send();
+    blockingReceive.join();
+    Require(Failed(blockingReceiveResult, 14));
+    Require(message.name_length == 16 && message.flags == -1);
+    Require(std::all_of(name, name + 16, [](std::uint8_t byte) { return byte == 0xa5; }));
+    Require(std::all_of(buffer, buffer + sizeof(buffer), [](char value) { return value == 0; }));
+    std::array<char, sizeof(payload)> blockingRecovery{};
+    Require(sceNetRecv(receiver, blockingRecovery.data(), blockingRecovery.size(), 0) == static_cast<std::int64_t>(sizeof(payload)));
+    Require(std::memcmp(blockingRecovery.data(), payload, sizeof(payload)) == 0);
+    Require(sceNetSetsockopt(receiver, 0xffff, 0x1200, &nonblocking, sizeof(nonblocking)) == 0);
+#endif
     send();
     waitForPacket();
     Require(Failed(sceNetRecvmsg(receiver, &message, 0), 14));
