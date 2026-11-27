@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <string>
 #include <thread>
 
@@ -112,6 +113,88 @@ std::string ServePlainHttpOnce(const std::string& response) {
     return url;
 }
 
+struct ResumedChunkedServer {
+    std::string url;
+    std::shared_future<void> tailSent;
+};
+
+ResumedChunkedServer ServeResumedChunkedBodyOnce() {
+#ifdef _WIN32
+    const SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    Require(listener != INVALID_SOCKET);
+#else
+    const int listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    Require(listener >= 0);
+#endif
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    Require(bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+    Require(listen(listener, 8) == 0);
+#ifdef _WIN32
+    int size = sizeof(address);
+#else
+    socklen_t size = sizeof(address);
+#endif
+    Require(getsockname(listener, reinterpret_cast<sockaddr*>(&address), &size) == 0);
+    const std::string url = "http://127.0.0.1:" + std::to_string(ntohs(address.sin_port)) + "/path";
+    const std::string headers = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    const std::string chunkHeader = "4000\r\n";
+    const std::string bodyAndTrailer = std::string(16384, 'C') + "\r\n0\r\nX-Trailer: value\r\n";
+    const std::string tail = "\r\n";
+    std::promise<void> tailPromise;
+    auto tailSent = tailPromise.get_future().share();
+    std::thread([listener, headers, chunkHeader, bodyAndTrailer, tail, tailPromise = std::move(tailPromise)]() mutable {
+#ifdef _WIN32
+        const SOCKET client = accept(listener, nullptr, nullptr);
+        if (client == INVALID_SOCKET) {
+            CloseSocket(listener);
+            tailPromise.set_value();
+            return;
+        }
+#else
+        const int client = accept(listener, nullptr, nullptr);
+        if (client < 0) {
+            CloseSocket(listener);
+            tailPromise.set_value();
+            return;
+        }
+#endif
+        std::array<char, 4096> input;
+        std::string seen;
+        while (seen.find("\r\n\r\n") == std::string::npos) {
+            const auto got = recv(client, input.data(), static_cast<int>(input.size()), 0);
+            if (got <= 0) break;
+            seen.append(input.data(), static_cast<std::size_t>(got));
+        }
+        const auto sendAll = [&](const std::string& bytes) {
+            std::size_t sent = 0;
+            while (sent < bytes.size()) {
+                const auto wrote = send(client, bytes.data() + sent, static_cast<int>(bytes.size() - sent), 0);
+                if (wrote <= 0) return false;
+                sent += static_cast<std::size_t>(wrote);
+            }
+            return true;
+        };
+        sendAll(headers);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        sendAll(chunkHeader);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        sendAll(bodyAndTrailer);
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+        sendAll(tail);
+        tailPromise.set_value();
+        for (;;) {
+            const auto drained = recv(client, input.data(), static_cast<int>(input.size()), 0);
+            if (drained <= 0) break;
+        }
+        CloseSocket(client);
+        CloseSocket(listener);
+    }).detach();
+    return {url, std::move(tailSent)};
+}
+
 std::string ServeStalledBodyOnce(const std::string& headers, const std::string& prefix) {
 #ifdef _WIN32
     const SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -191,6 +274,24 @@ void StalledReadReturnsCopiedPrefix(int tmpl) {
     Require(result == receiveTimedOut);
     Require(seen == prefix.size());
     for (std::size_t index = 0; index < seen; ++index) Require(buffer[index] == static_cast<std::uint8_t>('C'));
+    Require(sceHttp2ReadData(request, buffer.data(), buffer.size()) == receiveTimedOut);
+    Require(sceHttp2DeleteRequest(request) == 0);
+}
+
+void ChunkedReadKeepsTimeoutAfterServerResumes(int tmpl) {
+    auto server = ServeResumedChunkedBodyOnce();
+    const int request = sceHttp2CreateRequestWithURL(tmpl, "GET", server.url.c_str(), 0);
+    Require(request > 0);
+    Require(sceHttp2SetRecvTimeOut(request, 400000) == 0);
+    Require(sceHttp2SendRequest(request, nullptr, 0) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::array<std::uint8_t, 32768> buffer{};
+    const int first = sceHttp2ReadData(request, buffer.data(), buffer.size());
+    Require(first == 16384);
+    for (int index = 0; index < first; ++index) Require(buffer[static_cast<std::size_t>(index)] == static_cast<std::uint8_t>('C'));
+    Require(server.tailSent.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    const int second = sceHttp2ReadData(request, buffer.data() + first, buffer.size() - static_cast<std::size_t>(first));
+    Require(second == receiveTimedOut);
     Require(sceHttp2ReadData(request, buffer.data(), buffer.size()) == receiveTimedOut);
     Require(sceHttp2DeleteRequest(request) == 0);
 }
@@ -294,6 +395,7 @@ int main() {
     UnmappedSendRequest(tmpl);
     UnmappedGzipReadData(context);
     StalledReadReturnsCopiedPrefix(tmpl);
+    ChunkedReadKeepsTimeoutAfterServerResumes(tmpl);
 
     std::puts("guest_http2_guest_pointers ok");
     return 0;

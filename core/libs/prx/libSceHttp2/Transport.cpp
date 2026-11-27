@@ -1293,8 +1293,10 @@ int Request::Read(void* data, std::size_t size) {
                 int count = 0;
                 try {
                     count = state->ReadHttp1(staging.data(), chunk, deadline);
-                } catch (const RequestFailure&) {
+                } catch (const RequestFailure& failure) {
                     if (!total) throw;
+                    state->readResult = failure.code;
+                    state->Close();
                     break;
                 }
                 if (count <= 0) break;
