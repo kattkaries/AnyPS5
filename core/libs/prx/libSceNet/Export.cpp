@@ -1994,11 +1994,11 @@ static int64_t ReceiveMessage(int s, NetMsghdr* msg, int flags) {
         const GuestArena::HostWrite nameOutput(header.name, nameBytes);
         if (!nameOutput.Open()) {
 #ifdef _WIN32
-            if ((flags & NET_MSG_DONTWAIT) != 0 || socket.native->nonblock.load()) {
-                char probe{};
-                if (::recvfrom(socket.native->value, &probe, sizeof(probe), MSG_PEEK, nullptr, nullptr) < 0 &&
-                    WSAGetLastError() == WSAEWOULDBLOCK) return fail(NET_EAGAIN);
-            }
+            char probe{};
+            const auto probed = native_transfer(*socket.native, flags, false, [&](int) {
+                return ::recvfrom(socket.native->value, &probe, sizeof(probe), MSG_PEEK, nullptr, nullptr);
+            });
+            if (probed < 0 && WSAGetLastError() != WSAEMSGSIZE) return fail(native_error());
 #endif
             return fail(NET_EFAULT);
         }
